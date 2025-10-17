@@ -21,7 +21,7 @@ jobs:
     if: |
       (github.event_name == 'check_run' && 
        github.event.check_run.name == 'Kusari Inspector' && 
-       github.event.check_run.conclusion == 'success') ||
+       github.event.check_run.conclusion == 'failure') ||
       github.event_name == 'workflow_dispatch'
     
     runs-on: ubuntu-latest
