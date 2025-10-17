@@ -1,0 +1,243 @@
+name: Manual Kusari Dependency Update
+
+on:
+  workflow_dispatch:
+    inputs:
+      create_pr:
+        description: 'Create a PR with updates (true) or commit directly (false)'
+        required: false
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+  schedule:
+    # Run weekly on Mondays at 9 AM UTC
+    - cron: '0 9 * * 1'
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  kusari-update:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install Kusari CLI
+        run: |
+          # Check if Kusari CLI is available
+          if ! command -v kusari &> /dev/null; then
+            echo "Kusari CLI not found. Please install it first."
+            echo "Visit https://kusari.dev for installation instructions"
+            exit 1
+          fi
+
+      - name: Run Kusari Scan
+        id: kusari_scan
+        run: |
+          echo "Running Kusari repository scan..."
+          
+          # Run Kusari scan and save output
+          kusari repo scan > kusari_output.txt 2>&1 || true
+          
+          # Check if scan was successful and has dependency updates
+          if grep -q "Dependency Changes Introduced" kusari_output.txt && \
+             grep -q "updated\|added" kusari_output.txt; then
+            echo "has_updates=true" >> $GITHUB_OUTPUT
+            echo "Dependency updates found"
+            
+            # Count updates
+            UPDATE_COUNT=$(grep -E "│.*updated.*→" kusari_output.txt | wc -l)
+            echo "update_count=$UPDATE_COUNT" >> $GITHUB_OUTPUT
+          else
+            echo "has_updates=false" >> $GITHUB_OUTPUT
+            echo "No dependency updates needed"
+          fi
+
+      - name: Apply Updates
+        if: steps.kusari_scan.outputs.has_updates == 'true'
+        id: apply_updates
+        run: |
+          echo "Applying dependency updates..."
+          
+          # Copy the updater script if it doesn't exist
+          if [ ! -f "kusari_updater.py" ]; then
+            echo "Downloading kusari_updater.py..."
+            # You might want to store this in a central location or package
+            # For now, we'll assume it's in the repo
+          fi
+          
+          # Run the updater
+          python3 kusari_updater.py --file kusari_output.txt --skip-install
+          
+          # Check if changes were made
+          if git diff --quiet package.json; then
+            echo "No changes to package.json"
+            echo "changes_made=false" >> $GITHUB_OUTPUT
+          else
+            echo "package.json was updated"
+            echo "changes_made=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Run npm install
+        if: steps.apply_updates.outputs.changes_made == 'true'
+        run: |
+          echo "Updating package-lock.json..."
+          npm install
+
+      - name: Generate Update Summary
+        if: steps.apply_updates.outputs.changes_made == 'true'
+        id: summary
+        run: |
+          # Create a summary of changes
+          SUMMARY=$(python3 -c "
+          import re
+          import json
+          from datetime import datetime
+          
+          updates = []
+          security_fixes = 0
+          
+          with open('kusari_output.txt', 'r') as f:
+              content = f.read()
+              
+              # Find updated packages
+              pattern = r'([^│]+?)\s+│\s+updated\s+│\s+([^→]+)\s+→\s+([^\s│]+)'
+              for match in re.finditer(pattern, content):
+                  pkg = match.group(1).strip()
+                  old_ver = match.group(2).strip()
+                  new_ver = match.group(3).strip()
+                  if not ('@rollup/rollup-' in pkg or '@esbuild/' in pkg):
+                      updates.append(f'- \`{pkg}\`: {old_ver} → {new_ver}')
+              
+              # Count CVEs
+              security_fixes = len(re.findall(r'CVE-\d{4}-\d+', content))
+          
+          print(f'Found {len(updates)} dependency updates')
+          if security_fixes > 0:
+              print(f'Addresses {security_fixes} security vulnerabilities')
+          print('')
+          print('\\n'.join(updates[:15]))  # Show first 15 updates
+          if len(updates) > 15:
+              print(f'... and {len(updates) - 15} more')
+          ")
+          
+          echo "summary<<EOF" >> $GITHUB_OUTPUT
+          echo "$SUMMARY" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Create PR
+        if: steps.apply_updates.outputs.changes_made == 'true' && (github.event.inputs.create_pr == 'true' || github.event_name == 'schedule')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Configure git
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          
+          # Create a branch
+          BRANCH_NAME="kusari-updates-$(date +%Y%m%d-%H%M%S)"
+          git checkout -b "$BRANCH_NAME"
+          
+          # Commit changes
+          git add package.json package-lock.json
+          git commit -m "chore: apply Kusari security updates" \
+            -m "Automated dependency updates based on Kusari security scan" \
+            -m "${{ steps.summary.outputs.summary }}"
+          
+          # Push branch
+          git push origin "$BRANCH_NAME"
+          
+          # Create PR
+          PR_BODY=$(cat <<EOF
+          ## 🔐 Automated Security Updates from Kusari
+          
+          This PR contains dependency updates identified by Kusari's security scan.
+          
+          ### 📋 Summary
+          ${{ steps.summary.outputs.summary }}
+          
+          ### 🔍 Review Checklist
+          - [ ] Review the dependency changes in \`package.json\`
+          - [ ] Verify that tests pass with the updated dependencies
+          - [ ] Check for any breaking changes in the updated packages
+          - [ ] Review the [Kusari analysis details](kusari_output.txt) if needed
+          
+          ### 🤖 Automation
+          This PR was automatically created by the Kusari dependency update workflow.
+          It runs weekly to keep dependencies secure and up-to-date.
+          
+          ---
+          *Generated on $(date -u +"%Y-%m-%d %H:%M UTC")*
+          EOF
+          )
+          
+          gh pr create \
+            --title "🔐 Security: Apply Kusari dependency updates" \
+            --body "$PR_BODY" \
+            --label "dependencies,security,automated" \
+            --base main
+
+      - name: Commit Directly
+        if: steps.apply_updates.outputs.changes_made == 'true' && github.event.inputs.create_pr == 'false' && github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Configure git
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          
+          # Commit and push to main
+          git add package.json package-lock.json
+          git commit -m "chore: apply Kusari security updates" \
+            -m "Automated dependency updates based on Kusari security scan" \
+            -m "${{ steps.summary.outputs.summary }}"
+          
+          git push origin main
+
+      - name: Upload Kusari Report
+        if: always() && steps.kusari_scan.outputs.has_updates == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: kusari-scan-report
+          path: kusari_output.txt
+          retention-days: 30
+
+      - name: Job Summary
+        if: always()
+        run: |
+          echo "## Kusari Dependency Update Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ steps.kusari_scan.outputs.has_updates }}" == "true" ]; then
+            echo "✅ **Updates Found:** ${{ steps.kusari_scan.outputs.update_count }} dependencies need updating" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            
+            if [ "${{ steps.apply_updates.outputs.changes_made }}" == "true" ]; then
+              echo "### Changes Applied:" >> $GITHUB_STEP_SUMMARY
+              echo "${{ steps.summary.outputs.summary }}" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "⚠️ No changes were needed in package.json (updates may be transitive dependencies)" >> $GITHUB_STEP_SUMMARY
+            fi
+          else
+            echo "✨ **All dependencies are up-to-date!**" >> $GITHUB_STEP_SUMMARY
+            echo "No security updates needed at this time." >> $GITHUB_STEP_SUMMARY
+          fi
